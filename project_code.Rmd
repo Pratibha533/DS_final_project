@@ -1,0 +1,274 @@
+---
+title: "Data Science Final project"
+author: "Pratibha Gautam"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+  word_document: default
+---
+
+page 25 https://arxiv.org/pdf/2110.00530.pdf
+
+Diabetes 130-US hospitals for years 1999-2008 Data Set
+
+https://archive.ics.uci.edu/ml/datasets/diabetes+130-us+hospitals+for+years+1999-2008
+
+https://www.hindawi.com/journals/bmri/2014/781670/tab1/
+
+Can we predict patient re-admission using machine learning? 
+Are our predictions of re-admission fair across gender and across race? Are they fair at the intersection of these groups?
+Can we fix our predictions so that they ar fair.
+
+Description of dataset here 
+
+
+# Data Cleaning and Imputation
+```{r}
+library(tidyr)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(e1071)
+library(pROC)
+library(ggplot2)
+library(pROC)
+```
+
+
+```{r}
+data <- read.csv("dataset_diabetes/diabetic_data.csv")
+
+```
+
+```{r}
+# first get rid of all points where we dont have information about re-admission
+data = data[data$readmitted %in% c("<30", ">30"), ]
+print(paste0("We have remaining points:", nrow(data)))
+data$readmitted = ifelse(data$readmitted == ">30", 0, 1)
+table(data$readmitted)
+
+```
+
+```{r}
+missing_frac_col = rep(0,ncol(data))
+for (i in 1:ncol(data)) {
+  percent_missing = sum(data[[i]] == "?")/nrow(data)
+  missing_frac_col[i] = percent_missing
+}
+missing_frac_col = data.frame(missing_frac_col)
+colnames(missing_frac_col) = "missing_frac"
+missing_frac_col = cbind(colnames(data),missing_frac_col)
+missing_frac_col = missing_frac_col[order(missing_frac_col$missing_frac,decreasing = TRUE),]
+missing_frac_col = missing_frac_col[missing_frac_col$missing_frac > 0,]
+barplot(missing_frac_col$missing_frac,names.arg = missing_frac_col$colnames,las = 2,cex.names = 0.6,main = "Missing Fraction of Each Column",xlab = "Column Name",ylab = "Missing Fraction")
+
+```
+```{r}
+data %>% gather()  %>% filter(key %in% c("age", "race","gender")) %>%  ggplot(aes(x = value)) + geom_bar() + facet_wrap(~key, scales = "free") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+
+
+```{r}
+plot_prop <- function(df, col, label){
+  df %>%
+    group_by(!!sym(col)) %>%
+    summarise(prop = mean(!!sym(label))) %>%
+    ggplot(aes(x = !!sym(col), y = prop)) +
+    geom_bar(stat = "identity") +
+    labs(x = col, y = "Proportion of label being 1")
+}
+
+plot_prop(data, "gender", "readmitted")
+plot_prop(data, "race", "readmitted")
+
+
+```
+
+
+
+
+```{r}
+# remove columns with one unique values
+data = data[, -which(names(data) == "examide")]
+data = data[, -which(names(data) == "citoglipton")]
+
+# we are going to remove columns that have more than 10% missigness
+for (col in colnames(data)) {
+  percent_missing = sum(data[[col]] == "?")/nrow(data)
+  print(paste(col, sum(data[[col]] == "?")/nrow(data)))
+  if (percent_missing >= 0.1){
+        data = data[, !(names(data) %in% col)]
+  }
+}
+```
+
+```{r}
+# rest of columns we will impute with most common element
+for (i in 1:ncol(data)) {
+  if (any(data[, i] == "?")) {
+    most_common = names(sort(table(data[, i]), decreasing = TRUE))[1]
+    data[, i] = ifelse(data[, i] == "?", most_common, data[, i])
+  }
+}
+# remove column "encounter_id"
+data = data[, -1]
+# remove column "patient_nbr"
+data = data[, -1]
+# remov diag_3, secondary diagnosis, too redundant
+data = data[, -which(names(data) == "diag_3")]
+
+
+```
+
+```{r}
+for (i in 1:ncol(data)) {
+  print(paste(names(data)[i], length(unique(data[, i]))))
+}
+```
+
+
+
+```{r}
+data = data[, -which(names(data) == "metformin.rosiglitazone")]
+data = data[, -which(names(data) == "metformin.pioglitazone")]
+
+
+for (i in 1:ncol(data)) {
+  if ((colnames(data)[i] %in% c("diag_1","diag_2","diag_3"))) {
+    most_common = names(sort(table(data[, i]), decreasing = TRUE))[1:50]
+    data[, i] = ifelse(data[, i] %in% most_common, data[, i], "other")
+  } 
+}
+
+for (i in 1:ncol(data)) {
+  if (length(unique(data[, i])) > 7 & !(colnames(data)[i] %in% c("age","diag_1","diag_2","diag_3"))) {
+    data[, i] = as.numeric(data[, i])
+  } else {
+    data[, i] = as.factor(data[, i])
+  }
+}
+
+```
+
+```{r}
+data_copy = data[1:10]
+data_copy[] <- lapply(data_copy,as.integer)
+library(sjPlot)
+sjp.corr(data_copy, wrap.labels =10, show.legend = TRUE)
+```
+
+
+
+
+
+
+
+# Learning Models
+
+```{r}
+# we will use sample splitting, and split into train, val and test 70:10:20
+set.seed(2020)
+trainIndex <- createDataPartition(y = data$readmitted, p = 0.7, list = FALSE)
+train_data <- data[trainIndex, ]
+test_data <- data[-trainIndex, ]
+valIndex <- createDataPartition(y = test_data$readmitted, p = 0.333, list = FALSE)
+val_data <- test_data[valIndex, ]
+test_data <- test_data[-valIndex, ]
+print(paste("train size:", nrow(train_data)))
+print(paste("test size:", nrow(test_data)))
+print(paste("val size:", nrow(val_data)))
+```
+## Feature Selection
+
+```{r}
+#use roc_curve area as score
+roc_imp <- filterVarImp(x = data[,1:39], y = data$readmitted)
+
+#sort the score in decreasing order
+roc_imp <- data.frame(cbind(variable = rownames(roc_imp), score = roc_imp[,1]))
+roc_imp$score <- as.double(roc_imp$score)
+roc_imp = roc_imp[order(roc_imp$score,decreasing = TRUE),]
+roc_imp %>%
+  select(variable, score) %>%
+  knitr::kable()
+
+```
+
+
+## Different Models
+
+```{r}
+
+linear <- glm(readmitted ~ ., data = train_data, family = 'binomial')
+linear_pred <- predict(linear, newdata = val_data, type = "response")
+linear_auc <- auc(val_data$readmitted, linear_pred)
+linear_acc <- mean(val_data$readmitted == round(linear_pred))
+print(linear_acc)
+print(linear_auc)
+```
+
+```{r}
+
+rf <- randomForest(readmitted ~ ., data = train_data, probability = TRUE)
+rf_pred <- predict(rf, newdata = val_data,  type = "prob")[,2]
+rf_auc <- auc(val_data$readmitted, rf_pred)
+rf_acc <- mean(val_data$readmitted == round(rf_pred))
+print(rf_auc)
+print(rf_acc)
+```
+
+RF is better, so we will use it as our final model
+
+```{r}
+
+rf_pred <- predict(rf, newdata = test_data,  type = "prob")[,2]
+print(ci.auc(test_data$readmitted, rf_pred, conf.level = 0.9) )
+print(mean(test_data$readmitted == round(rf_pred)))
+
+
+```
+
+Now let us evaluate the performance by group
+
+```{r}
+test_data$rf_pred = rf_pred
+test_data$acc = (rf_pred == test_data$readmitted)
+
+```
+
+
+
+
+```{r}
+plot_prop <- function(df, col){
+  df %>%
+    group_by(!!sym(col)) %>%
+    summarise(prop = auc(readmitted, rf_pred)[1], conf_i1 = ci.auc(readmitted, rf_pred, conf.level = 0.9)[1], conf_i2 = ci.auc(readmitted, rf_pred, conf.level = 0.9)[3] ) %>%
+    ggplot(aes(x = !!sym(col), y = prop)) +
+    geom_errorbar(width=.1, aes(ymin=conf_i1, ymax=conf_i2)) +
+    geom_point(shape=21, size=3, fill="black") +
+    labs(x = col, y = "AUC on Test")
+}
+
+plot_prop(test_data, "gender")
+plot_prop(test_data, "race")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
